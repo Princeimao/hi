@@ -1,0 +1,10 @@
+import "dotenv/config";
+const boot = await fetch("http://127.0.0.1:8787/api/auth/device-bootstrap", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ label: "tool-smoke" }) });
+const { accessToken, userId } = await boot.json();
+const toolkit = await import("./dist/agents/toolkit.js");
+const tools = await toolkit.listAvailableTools(userId);
+console.log("tools:", tools.map((t) => t.id).join(", ") || "(none)");
+const pick = await toolkit.pickTool(userId, "go search the web for the best flight deals from delhi to mumbai right now");
+console.log("pick:", JSON.stringify(pick));
+const out = pick ? await toolkit.runForChat(userId, "go search the web for the best flight deals from delhi to mumbai right now") : null;
+console.log("out:", String(out).slice(0, 300));

@@ -1,0 +1,7 @@
+# HI agents — local runtime (real uAgents + backend WS gateway)
+# Targets Python 3.10+ (tested on 3.14).
+uagents>=0.26.1
+aiohttp>=3.9
+
+# For the Agentverse-hosted pull-mode agents (agents/hosted/*):
+# requests is already part of the Agentverse runtime sandbox.

@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+dist-electron/
+build/
+*.tsbuildinfo
+
+# logs
+*.log
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# expo / react native
+.expo/
+web-build/
+android/
+ios/
+
+# os
+.DS_Store
+Thumbs.db
