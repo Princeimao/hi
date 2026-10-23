@@ -48,7 +48,7 @@ function SessionsEmpty({ liveIds }: { liveIds: string[] }): React.ReactElement {
   if (status?.claude) installedMap.set("claude", status.claude.installed);
   for (const a of status?.agents ?? []) installedMap.set(a.id, a.installed);
   const rows = WATCHED_AGENTS.map((id) => {
-    const installed = installedMap.get(id) ?? id === "pi";
+    const installed = installedMap.get(id) ?? false;
     const connected = live.has(id);
     return { id, installed, connected };
   });
@@ -84,9 +84,6 @@ function SessionsEmpty({ liveIds }: { liveIds: string[] }): React.ReactElement {
               </span>
             </div>
           ))}
-        </div>
-        <div className="text-[10px] text-neutral-500">
-          Pi runs locally for file, search and coding work — just ask in Chat.
         </div>
       </div>
     </div>

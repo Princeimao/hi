@@ -17,12 +17,11 @@ export const KNOWN_AGENTS: Record<string, KnownAgent> = {
   opencode: { name: "OpenCode", color: "#4ADE80" },
   amp: { name: "Amp", color: "#F59E0B" },
   hermes: { name: "Hermes", color: "#C084FC" },
-  pi: { name: "Pi (local)", color: "#A78BFA" },
   "claude-desktop": { name: "Claude Desktop", color: "#D97757" },
 };
 
 /// Every agent Hi watches on this machine, for the Sessions empty state.
-export const WATCHED_AGENTS = ["claude", "opencode", "cursor", "antigravity", "amp", "hermes", "codex", "gemini", "pi"] as const;
+export const WATCHED_AGENTS = ["claude", "opencode", "cursor", "antigravity", "amp", "hermes", "codex", "gemini"] as const;
 
 /// Agents whose permission requests get an Allow / Deny card, as on the Mac.
 /// Must match `takesDecisions` in reply.ts: any other agent's request is

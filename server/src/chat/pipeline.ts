@@ -13,20 +13,6 @@ import {
   insertMessage,
 } from "./messages.js";
 
-/** Last Pi cwd per conversation, so follow-ups ("name all of them") reuse it. */
-const lastLocalCwd = new Map<string, { cwd?: string; at: number }>();
-const LOCAL_FOLLOWUP_MS = 5 * 60_000;
-
-/**
- * A short referential follow-up right after a local run: "name all of them",
- * "what about the others", "open the first one", "how big is it".
- */
-export function isLocalFollowup(text: string): boolean {
-  const t = text.toLowerCase().trim();
-  if (t.length > 160) return false;
-  return /\b(them|those|these|it|its|the first|the second|the last|the others|all of|list (em|them)|name (em|them)|show (em|them)|what about|how (big|many|much|long)|open (it|the first|the last)|read (it|the first|the last)|the rest|same (one|folder|directory|drive))\b/i.test(t);
-}
-
 /**
  * The chat pipeline — the entry point for everything a user sends.
  * A user message becomes: persisted message → memory recall → a `chat` task
@@ -114,54 +100,10 @@ async function handleSend(
   await bus.emit(userId, { type: "chat.message", message: assistantMessage });
   bus.live(userId, { type: "avatar.state", state: "thinking", reason: "replying" });
 
-  // 4. Split local vs cloud. Local file / code / search work runs the Pi agent
-  //    directly on this machine (child_process, no island round-trip). Cloud
-  //    work (chat, Agentverse friends, GitHub/Vercel/Notion) goes to the
-  //    cloud agent. The agent never hallucinates a tool call that didn't run.
+  // 4. Cloud work (chat, Agentverse friends, GitHub/Vercel/Notion) goes to the
+  //    cloud agent through the toolkit. The agent never hallucinates a tool
+  //    call that didn't run.
   const history = await recentHistory(userId, conversation.id, 14);
-  let localTask = detectLocalTask(effective);
-
-  // Follow-up: a short referential message right after a local run reuses the
-  // last cwd, so "name all of them" after "files in E:\" still hits Pi.
-  if (!localTask) {
-    const prev = lastLocalCwd.get(conversation.id);
-    if (prev && Date.now() - prev.at < LOCAL_FOLLOWUP_MS && isLocalFollowup(effective)) {
-      localTask = { prompt: effective, cwd: prev.cwd };
-    }
-  }
-
-  if (localTask) {
-    lastLocalCwd.set(conversation.id, { cwd: localTask.cwd, at: Date.now() });
-    // Local: run Pi now, then have the cloud agent write the final reply using
-    // Pi's output as context. Pi is the hands; the cloud agent is the voice.
-    let piOutput = "";
-    try {
-      const { runPiTask } = await import("../agents/pi-runner.js");
-      piOutput = await runPiTask(localTask.prompt, localTask.cwd);
-    } catch (err) {
-      piOutput = `(Pi failed to run: ${err instanceof Error ? err.message : String(err)})`;
-    }
-    await delegation.createTask({
-      userId,
-      conversationId: conversation.id,
-      kind: "chat",
-      title: `Reply: ${effective.slice(0, 44)}`,
-      payload: { messageId: assistantMessage.id, text: effective, tools: piOutput },
-      context: {
-        kind: "chat",
-        conversationId: conversation.id,
-        messageId: assistantMessage.id,
-        text: effective,
-        history,
-        memories: memoryContext,
-        tools: piOutput,
-        local: true,
-      },
-    });
-    return;
-  }
-
-  // Cloud: normal chat, friends, integrations.
   let toolContext: string | undefined;
   try {
     const toolkit = await import("../agents/toolkit.js");
@@ -220,42 +162,3 @@ export function stripToolDumps(text: string): string {
   return out.replace(/\n{3,}/g, "\n\n").trim();
 }
 
-/**
- * Detect a local file / code / search task and describe it for Pi.
- * Returns null when the message is cloud work (chat, friends, integrations).
- */
-export function detectLocalTask(text: string): { prompt: string; cwd?: string } | null {
-  const t = text.toLowerCase().trim();
-
-  // "list files in X" / "what's in X" / "dir X" / "ls X"
-  const dirMatch =
-    t.match(/(?:list|show|see|what(?:'s| is) in|open|browse)\s+(?:the\s+)?(?:files?|folder|directory|contents?)\s+(?:in|of|at|under)\s+['"]?([^\s'"]+)/i) ??
-    t.match(/(?:dir|ls)\s+['"]?([^\s'"]+)/i);
-  if (dirMatch) {
-    const p = dirMatch[1].replace(/[.,;:!?]+$/, "");
-    return { prompt: `List the files and folders in ${p}. Show names, sizes and dates.`, cwd: p };
-  }
-
-  const bare = t.match(/^(?:dir|ls)\s+['"]?([^\s'"]+)['"]?\s*$/i);
-  if (bare) return { prompt: `List the files and folders in ${bare[1]}. Show names, sizes and dates.`, cwd: bare[1] };
-
-  // "search/find/look for X in Y"
-  const searchMatch = t.match(/(?:search|find|look\s+for|grep|locate)\s+(?:['"]?([^'"]+?)['"]?)\s+(?:in|inside|within)\s+['"]?([^\s'"]+)/i);
-  if (searchMatch) {
-    return {
-      prompt: `Search for files matching "${searchMatch[1].trim()}" inside ${searchMatch[2]}. List the matching paths.`,
-      cwd: searchMatch[2],
-    };
-  }
-
-  // "read/open file X"
-  const readMatch = t.match(/(?:read|open|show|cat|type)\s+(?:the\s+)?(?:file\s+)?['"]?([^\s'"]+\.[a-z0-9]+)['"]?/i);
-  if (readMatch) return { prompt: `Read the file ${readMatch[1]} and show its contents.` };
-
-  // "write/create/build/code X" — coding tasks, let Pi pick the folder via clarify
-  if (/\b(write|create|build|code|implement|make|generate|add|fix|refactor|debug)\b/i.test(t) && /\b(function|component|file|script|feature|module|class|test|page|button|api|endpoint|util)\b/i.test(t)) {
-    return { prompt: text };
-  }
-
-  return null;
-}

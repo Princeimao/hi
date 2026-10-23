@@ -50,10 +50,9 @@ async def handle_chat(task: Dict[str, Any], emit: Emit, context: Dict[str, Any])
         "Cal.com or Notion connected, end with a short follow-up offer like: 'Want me to put this "
         "trip on your Cal.com calendar or save it to Notion?' — only when it genuinely fits, never "
         "as a generic closer.",
-        "Local file, directory and coding work is handled by the Pi agent running on the user's PC. "
-        "When a tool result is provided below, that is Pi's real output from their machine — "
-        "present it clearly, credit Pi, never invent tool data, and NEVER claim you ran a command "
-        "yourself.",
+        "When a tool result is provided below, that is real output from the user's machine — "
+        "present it clearly, credit the source, never invent tool data, and NEVER claim you ran a "
+        "command yourself.",
         "NEVER fabricate tool calls or say a command failed unless the tool result below says so. "
         "If no tool result is provided, you have no local access — answer from conversation only.",
     ]

@@ -120,20 +120,6 @@ export function ChatPanel(): React.ReactElement {
         }
         return;
       }
-      if (type === "chat.send") {
-        // Local-looking prompts get a live Pi session immediately.
-        const text = String(event["text"] ?? "");
-        if (/\b(list|dir|ls|find|search|read|open|count|files?|folder|directory|how many)\b/i.test(text)) {
-          window.hi.sessionSynthetic({
-            hook_event_name: "PreToolUse",
-            hi_agent: "pi",
-            cwd: "",
-            tool_name: "powershell",
-            tool_input: { command: text.slice(0, 80) },
-          });
-        }
-        return;
-      }
       if (type === "chat.delta") {
         const messageId = String(event["messageId"] ?? "");
         if (!messageId) return;
@@ -158,18 +144,6 @@ export function ChatPanel(): React.ReactElement {
         };
         setToolCards((prev) => [...prev.slice(-4), card]);
         setTools((prev) => [...prev.slice(-3), { label: card.label, ok: card.ok }]);
-        // Surface local work as a live session in the Sessions tab.
-        const isLocal = card.tool === "local.exec" || card.tool === "pi.code";
-        if (isLocal) {
-          window.hi.sessionSynthetic({
-            hook_event_name: "Stop",
-            hi_agent: "pi",
-            cwd: "",
-            last_assistant_message: card.ok
-              ? card.output.split("\n").filter(Boolean).slice(0, 3).join(" · ").slice(0, 120)
-              : `failed: ${card.output.slice(0, 100)}`,
-          });
-        }
         return;
       }
       if (type === "chat.timer") {

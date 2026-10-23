@@ -75,15 +75,6 @@ export async function listAvailableTools(userId: string): Promise<ToolDescriptor
       "Args: { command: string, cwd?: string }. Use for reading files, listing directories, checking processes, " +
       "or anything that needs real local machine access. Returns stdout+stderr (truncated).",
   });
-  tools.push({
-    id: "pi.code",
-    label: "Pi: write code on the user's PC",
-    description:
-      "Delegate a coding task to the Pi agent running on the user's actual machine (reads/writes real files). " +
-      "Args: { task: string, cwd: string }. cwd is the folder to work in (must be confirmed with the user first " +
-      "via a clarify card). Pi has its own model keys and can inspect, create and edit files. " +
-      "Returns Pi's final summary of what it did.",
-  });
   return tools;
 }
 
@@ -194,26 +185,6 @@ export async function runLocalExec(userId: string, args: Record<string, unknown>
   return out || "(command ran, no output)";
 }
 
-/** Delegate a coding task to the Pi agent on the user's PC (pi.code). */
-async function runPiCode(userId: string, args: Record<string, unknown>): Promise<string> {
-  const task = String(args.task ?? "").trim();
-  const cwd = String(args.cwd ?? "").trim() || undefined;
-  if (!task) return "(pi.code needs a task)";
-  // Pi print mode: one-shot, final assistant text on stdout, exits when done.
-  // --no-session keeps runs independent; quote the task for the shell.
-  const quoted = task.replaceAll('"', '\\"');
-  const command = `pi --print --no-session "${quoted}"`;
-  const reply = await hub.callDesktop(
-    userId,
-    { type: "local.exec", command, cwd },
-    115_000,
-  );
-  if (!reply) return "(the desktop island is not connected — the user must have Hi open on their PC)";
-  if (reply.ok === false) return `(Pi failed: ${String(reply.error ?? "unknown")})`;
-  const out = String(reply.output ?? "").trim();
-  return out || "(Pi ran but produced no output)";
-}
-
 /** Send a message to a connected friend agent and wait for its reply. */
 async function runFriendTool(userId: string, friendId: string, text: string): Promise<string> {
   const msg = await friendsInt.send(userId, friendId, text);
@@ -243,13 +214,11 @@ async function runFriendTool(userId: string, friendId: string, text: string): Pr
 export async function executeTool(userId: string, pick: { id: string; args: Record<string, unknown> }): Promise<ToolResult> {
   const friends = await friendsInt.listFriends(userId).catch(() => [] as Awaited<ReturnType<typeof friendsInt.listFriends>>);
   const friend = pick.id.startsWith("friend:") ? friends.find((f) => f.id === pick.id.slice(7)) : null;
-  const label = friend ? `Agentverse: ${friend.name}` : pick.id === "local.exec" ? "Local PC: run command" : pick.id === "pi.code" ? "Pi: writing code" : pick.id.replace(".", ": ");
+  const label = friend ? `Agentverse: ${friend.name}` : pick.id === "local.exec" ? "Local PC: run command" : pick.id.replace(".", ": ");
   try {
     let output: string;
     if (pick.id === "local.exec") {
       output = await runLocalExec(userId, pick.args);
-    } else if (pick.id === "pi.code") {
-      output = await runPiCode(userId, pick.args);
     } else if (friend) {
       const ask = String(pick.args.text ?? pick.args.question ?? "").trim();
       output = await runFriendTool(userId, friend.id, ask);
