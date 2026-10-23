@@ -55,6 +55,16 @@ export type DesktopOutgoing =
       decision: "allow" | "deny";
       answers?: Record<string, string | string[]>;
     }
+  | { type: "coding.task.step"; taskId: string; label: string }
+  | { type: "coding.task.output"; taskId: string; text: string }
+  | { type: "coding.task.heartbeat"; taskId: string; progress?: number }
+  | {
+      type: "coding.task.result";
+      taskId: string;
+      result: Record<string, unknown>;
+      summary: string;
+    }
+  | { type: "coding.task.error"; taskId: string; error: string }
   | { type: "chat.send"; conversationId: string | null; text: string; clientMessageId?: string }
   | { type: "chat.stop"; conversationId: string; messageId: string }
   | { type: "local.result"; replyId: string; ok: boolean; output?: string; error?: string };
@@ -66,6 +76,16 @@ export type DesktopIncoming =
       decision: string;
       answers?: Record<string, string | string[]>;
     }
+  | {
+      type: "coding.task.assign";
+      taskId: string;
+      title?: string;
+      prompt: string;
+      agent: "claude" | "opencode" | "antigravity";
+      cwd?: string | null;
+      timeoutMs?: number;
+    }
+  | { type: "coding.task.cancel"; taskId: string }
   | { type: string; [extra: string]: unknown };
 
 interface WsLayer {
@@ -92,7 +112,10 @@ export class BackendRelay {
   private timer: NodeJS.Timeout | null = null;
   private onDecision: ((d: DesktopIncoming) => void) | null = null;
   private onEvent: ((e: Record<string, unknown>) => void) | null = null;
+  private onCoding: ((d: DesktopIncoming) => void) | null = null;
   private lastSnapshot: string | null = null;
+  /** Frames produced while the socket is down; flushed after the hello. */
+  private outbox: string[] = [];
   private stopped = false;
   private dialing = false;
 
@@ -101,11 +124,13 @@ export class BackendRelay {
     accessToken: string | null,
     onDecision: (d: DesktopIncoming) => void,
     onEvent: (e: Record<string, unknown>) => void,
+    onCoding?: (d: DesktopIncoming) => void,
   ): void {
     this.url = url;
     this.token = accessToken;
     this.onDecision = onDecision;
     this.onEvent = onEvent;
+    this.onCoding = onCoding ?? null;
     this.dial();
   }
 
@@ -157,6 +182,7 @@ export class BackendRelay {
             } satisfies DesktopOutgoing),
           );
           this.sendSnapshot();
+          this.flushOutbox();
         });
         ws.on("message", (data: unknown) => void this.receive(data));
         ws.on("close", () => {
@@ -201,6 +227,7 @@ export class BackendRelay {
       return;
     }
     if (frame.type === "coding.decision") this.onDecision?.(parsed as DesktopIncoming);
+    else if (frame.type.startsWith("coding.task.")) this.onCoding?.(parsed as DesktopIncoming);
     // Everything else (chat deltas, avatar.state, conversations…) streams to
     // the renderer over one channel; hello stays behind, but marks auth-time.
     else if (frame.type === "hello") this.lastAuthOkAt = Date.now();
@@ -254,6 +281,36 @@ export class BackendRelay {
     } satisfies DesktopOutgoing);
   }
 
+  codingStep(taskId: string, label: string): void {
+    this.send({ type: "coding.task.step", taskId, label: label.slice(0, 160) } satisfies DesktopOutgoing);
+  }
+
+  codingOutput(taskId: string, text: string): void {
+    if (!text) return;
+    this.send({ type: "coding.task.output", taskId, text: text.slice(0, 8000) } satisfies DesktopOutgoing);
+  }
+
+  codingHeartbeat(taskId: string, progress?: number): void {
+    this.send({
+      type: "coding.task.heartbeat",
+      taskId,
+      ...(progress !== undefined ? { progress } : {}),
+    } satisfies DesktopOutgoing);
+  }
+
+  codingResult(taskId: string, result: Record<string, unknown>, summary: string): void {
+    this.send({
+      type: "coding.task.result",
+      taskId,
+      result,
+      summary: summary.slice(0, 200),
+    } satisfies DesktopOutgoing);
+  }
+
+  codingError(taskId: string, error: string): void {
+    this.send({ type: "coding.task.error", taskId, error: error.slice(0, 2000) } satisfies DesktopOutgoing);
+  }
+
   sendChat(text: string, conversationId: string | null, clientMessageId?: string): void {
     if (!text.trim()) return;
     this.send({
@@ -273,17 +330,45 @@ export class BackendRelay {
     // approval card itself through the snapshot.
   }
 
+  /** Queue a frame while offline; the runner's results survive a short drop. */
   private send(frame: DesktopOutgoing): void {
+    const wire = JSON.stringify(frame);
     const ws = this.ws;
     if (!ws) {
+      this.enqueue(wire);
       this.dial();
       return;
     }
     try {
-      ws.send(JSON.stringify(frame));
+      ws.send(wire);
     } catch {
       this.ws = null;
+      this.enqueue(wire);
       this.scheduleReconnect();
+    }
+  }
+
+  private enqueue(wire: string): void {
+    if (wire.includes('"type":"device.hello"')) return;
+    if (this.outbox.length >= 300) this.outbox.shift();
+    this.outbox.push(wire);
+  }
+
+  private flushOutbox(): void {
+    const pending = this.outbox;
+    this.outbox = [];
+    for (let i = 0; i < pending.length; i += 1) {
+      const ws = this.ws;
+      if (!ws) {
+        this.outbox.push(...pending.slice(i));
+        return;
+      }
+      try {
+        ws.send(pending[i]!);
+      } catch {
+        this.outbox.push(...pending.slice(i));
+        return;
+      }
     }
   }
 

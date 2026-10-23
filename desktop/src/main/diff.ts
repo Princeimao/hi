@@ -57,13 +57,17 @@ export function fileChange(tool: string, input: Record<string, unknown> | null |
   if (!path) return null;
   let added = 0;
   let removed = 0;
-  if (tool === "Edit" || tool === "NotebookEdit") {
+  if (tool === "Edit" || tool === "NotebookEdit" || tool === "replace_file_content") {
     const oldText = input["old_string"];
     const newText = input["new_string"];
     if (typeof oldText !== "string" || typeof newText !== "string") return null;
     [added, removed] = lineDiff(oldText, newText);
-  } else if (tool === "MultiEdit") {
-    const edits = Array.isArray(input["edits"]) ? (input["edits"] as unknown[]) : [];
+  } else if (tool === "MultiEdit" || tool === "multi_replace_file_content") {
+    const edits = Array.isArray(input["edits"])
+      ? (input["edits"] as unknown[])
+      : Array.isArray(input["ReplacementChunks"])
+        ? (input["ReplacementChunks"] as unknown[])
+        : [];
     for (const edit of edits) {
       if (!edit || typeof edit !== "object") continue;
       const e = edit as Record<string, unknown>;
@@ -73,7 +77,7 @@ export function fileChange(tool: string, input: Record<string, unknown> | null |
       added += da;
       removed += dr;
     }
-  } else if (tool === "Write") {
+  } else if (tool === "Write" || tool === "write_file" || tool === "write_to_file") {
     const content = input["content"];
     if (typeof content !== "string") return null;
     added = count(splitLines(content).length);

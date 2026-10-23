@@ -114,6 +114,7 @@ declare global {
       relaunch(): void;
       setPaused(paused: boolean): void;
       home(): Promise<string>;
+      openExternal(url: string): Promise<boolean>;
       lanIp(): Promise<string>;
       restAuth(): Promise<RestAuth>;
       onHubEvent(cb: (event: Record<string, unknown>) => void): void;
@@ -126,6 +127,14 @@ declare global {
 }
 
 export const integration = {
+  /** Generic authenticated GET against /api — every browser view rides this. */
+  async get<T>(path: string): Promise<T> {
+    const { restBase, token: at } = await window.hi.restAuth();
+    const res = await fetch(`${restBase}/api${path}`, { headers: { Authorization: `Bearer ${at}` } });
+    const body = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+    if (!res.ok) throw new Error(body.message ?? body.error ?? `HTTP ${res.status}`);
+    return body as T;
+  },
   async list(): Promise<IntegrationInfo[]> {
     const { restBase, token } = await window.hi.restAuth();
     const res = await fetch(`${restBase}/api/integrations`, { headers: { Authorization: `Bearer ${token}` } });

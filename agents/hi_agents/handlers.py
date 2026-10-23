@@ -13,9 +13,11 @@ import json
 import re
 from typing import Any, Awaitable, Callable, Dict, List
 
-from . import asi
+from . import asi, coding
 
 Emit = Callable[[Dict[str, Any]], Awaitable[None]]
+
+_AGENT_LABELS = {"claude": "Claude Code", "opencode": "OpenCode", "antigravity": "Antigravity"}
 
 
 def _prompt(context: Dict[str, Any]) -> str:
@@ -24,6 +26,59 @@ def _prompt(context: Dict[str, Any]) -> str:
     task = context.get("task") or {}
     payload = task.get("payload") or {}
     return str(payload.get("prompt") or payload.get("text") or "")
+
+
+async def reply_via_coding(task: Dict[str, Any], emit: Emit, text: str) -> None:
+    """Run explicit code work through the desktop island, then report back."""
+    agent = coding.pick_agent(text)
+    label = _AGENT_LABELS.get(agent, agent)
+    await emit({"type": "task.step", "taskId": task["id"], "label": f"Asking {label} on your desktop"})
+    try:
+        started = await coding.start_coding_task(text, agent=agent)
+    except coding.CodingError as err:
+        await emit({"type": "task.error", "taskId": task["id"], "error": str(err)})
+        return
+
+    coding_task_id = coding.task_id_of(started)
+    if not coding_task_id:
+        await emit({"type": "task.error", "taskId": task["id"], "error": "the backend did not return a coding task id"})
+        return
+
+    await emit(
+        {
+            "type": "task.step",
+            "taskId": task["id"],
+            "label": f"{label} is running (task {coding_task_id[:8]})",
+        }
+    )
+    try:
+        snapshot = await coding.wait_for_task(coding_task_id, timeout=60)
+    except coding.CodingError as err:
+        await emit({"type": "task.error", "taskId": task["id"], "error": str(err)})
+        return
+
+    status = coding.task_status_of(snapshot) or "running"
+    if status == "completed":
+        output = coding.result_text(snapshot) or "The coding task finished."
+        body = f"Done with {label}.\n\n{output}"
+    elif status in ("failed", "cancelled"):
+        result = (snapshot.get("task") or {}).get("error") or coding.result_text(snapshot)
+        body = f"{label} {status}.\n\n{result or 'No details were reported.'}"
+    else:
+        body = (
+            f"Started {label} on your desktop (task {coding_task_id[:8]}). "
+            "It is still running; live progress is on your island and the result will land in your tasks."
+        )
+
+    await emit({"type": "text.delta", "taskId": task["id"], "text": body})
+    await emit(
+        {
+            "type": "task.result",
+            "taskId": task["id"],
+            "summary": body[:140],
+            "result": {"content": body, "codingTaskId": coding_task_id, "status": status},
+        }
+    )
 
 
 async def handle_chat(task: Dict[str, Any], emit: Emit, context: Dict[str, Any]) -> None:
@@ -35,6 +90,10 @@ async def handle_chat(task: Dict[str, Any], emit: Emit, context: Dict[str, Any])
     memories: List[Dict[str, str]] = context.get("memories") or []
     history: List[Dict[str, str]] = context.get("history") or []
     text = str(context.get("text", ""))
+
+    if coding.wants_coding(text):
+        await reply_via_coding(task, emit, text)
+        return
 
     system_parts = [
         "You are Hi, a warm, quick, slightly playful personal AI companion living in a little "

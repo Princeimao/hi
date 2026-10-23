@@ -24,6 +24,12 @@ export const config = {
   jwtSecret: process.env.JWT_SECRET ?? "",
   /** Bearer token the Python/Agentverse agents must present for the HTTP + WS agent API. */
   agentToken: process.env.AGENT_TOKEN ?? "",
+  /**
+   * Target user for agent-initiated desktop work (coding tasks). Agents do not
+   * carry a user identity, so a single-user deployment pins it here. When unset
+   * the server uses the only user with a live desktop island.
+   */
+  agentUserId: optional("HI_AGENT_USER_ID", undefined),
   /** Where the Expo push notifications service is called from. */
   expoAccessToken: process.env.EXPO_ACCESS_TOKEN ?? "",
   /** ASI:ONE API access (https://asi1.ai). OpenAI-compatible endpoint. */

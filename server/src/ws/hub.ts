@@ -195,6 +195,16 @@ class WsHubImpl {
   private codingStates = new Map<string, { sessions: Record<string, SessionWire>; pending: ApprovalWire | null }>();
   private wss: WebSocketServer | null = null;
   private onChatSend: ((userId: string, frame: ClientFrame) => Promise<void>) | null = null;
+  private onCodingFrame:
+    | ((userId: string, frame: Record<string, unknown>) => Promise<void>)
+    | null = null;
+
+  /** The coding broker owns task frames; the hub only authenticates them. */
+  setCodingFrameHandler(
+    fn: (userId: string, frame: Record<string, unknown>) => Promise<void>,
+  ): void {
+    this.onCodingFrame = fn;
+  }
 
   attach(
     server: Server,
@@ -365,6 +375,12 @@ class WsHubImpl {
       const replyId = String((frame as { replyId?: string }).replyId ?? "");
       const cb = replyId ? this.pendingDesktopCalls.get(replyId) : undefined;
       if (cb) cb(frame as Record<string, unknown>);
+      return;
+    }
+    if (String(frame.type ?? "").startsWith("coding.task.")) {
+      void this.onCodingFrame?.(conn.userId, frame as Record<string, unknown>).catch((err) =>
+        logger.error(`[ws] coding frame error: ${(err as Error).message}`),
+      );
       return;
     }
 
@@ -626,6 +642,33 @@ class WsHubImpl {
     } catch (err) {
       logger.warn(`[ws] send failed: ${(err as Error).message}`);
     }
+  }
+
+  /** Push a frame to every live desktop island of one user. */
+  sendToDesktop(userId: string, frame: Record<string, unknown>): boolean {
+    let sent = false;
+    for (const conn of this.desktops.values()) {
+      if (conn.userId !== userId || conn.socket.readyState !== 1) continue;
+      this.send(conn, frame);
+      sent = true;
+    }
+    return sent;
+  }
+
+  hasDesktop(userId: string): boolean {
+    for (const conn of this.desktops.values()) {
+      if (conn.userId === userId && conn.socket.readyState === 1) return true;
+    }
+    return false;
+  }
+
+  /** Users with at least one live island (agent API target resolution). */
+  onlineDesktopUserIds(): string[] {
+    const ids = new Set<string>();
+    for (const conn of this.desktops.values()) {
+      if (conn.socket.readyState === 1) ids.add(conn.userId);
+    }
+    return [...ids];
   }
 
   /** Send a frame to the user's live desktop island and await its reply. */

@@ -231,8 +231,27 @@ export async function githubRepos(userId: string, limit = 20): Promise<unknown[]
   const token = await needToken(userId, "github");
   const res = await call(token, "github", "GET", `https://api.github.com/user/repos?sort=pushed&per_page=${limit}`);
   if (!res.ok) return fail(res, "github", "repos list");
-  const repos = (await res.json()) as { full_name: string; private: boolean; pushed_at: string; description?: string }[];
-  return repos.map((r) => ({ name: r.full_name, private: r.private, pushedAt: r.pushed_at, description: r.description ?? "" }));
+  const repos = (await res.json()) as {
+    full_name: string;
+    private: boolean;
+    pushed_at: string;
+    description?: string;
+    language?: string | null;
+    stargazers_count?: number;
+    html_url?: string;
+    default_branch?: string;
+  }[];
+  return repos.map((r) => ({
+    name: r.full_name,
+    fullName: r.full_name,
+    private: r.private,
+    pushedAt: r.pushed_at,
+    description: r.description ?? "",
+    language: r.language ?? null,
+    stars: r.stargazers_count ?? 0,
+    url: r.html_url ?? `https://github.com/${r.full_name}`,
+    defaultBranch: r.default_branch ?? "main",
+  }));
 }
 
 export async function githubPulls(userId: string, repo: string, limit = 20): Promise<unknown[]> {
@@ -250,6 +269,7 @@ export async function githubPulls(userId: string, repo: string, limit = 20): Pro
     draft: boolean;
     user?: { login: string } | null;
     created_at: string;
+    html_url?: string;
   }[];
   return pulls.map((p) => ({
     number: p.number,
@@ -257,6 +277,101 @@ export async function githubPulls(userId: string, repo: string, limit = 20): Pro
     author: p.user?.login ?? null,
     draft: p.draft,
     createdAt: p.created_at,
+    url: p.html_url ?? null,
+  }));
+}
+
+/** Directory listing of a repo path via the contents API. */
+export async function githubContents(userId: string, repo: string, path = ""): Promise<unknown[]> {
+  const token = await needToken(userId, "github");
+  const encoded = path.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+  const res = await call(token, "github", "GET", `https://api.github.com/repos/${repo}/contents/${encoded}`);
+  if (!res.ok) return fail(res, "github", `contents of ${path || "/"}`);
+  const body = (await res.json()) as
+    | { name: string; path: string; type: string; size?: number }[]
+    | { name: string; path: string; type: string; size?: number };
+  const entries = Array.isArray(body) ? body : [body];
+  return entries.map((f) => ({
+    name: f.name,
+    path: f.path,
+    type: f.type === "dir" ? "dir" : "file",
+    size: f.size ?? 0,
+  }));
+}
+
+/** Text content of one repo file, decoded from base64. Large binaries are refused. */
+export async function githubFile(
+  userId: string,
+  repo: string,
+  path: string,
+): Promise<{ name: string; path: string; size: number; text?: string; tooLarge?: boolean }> {
+  const token = await needToken(userId, "github");
+  const encoded = path.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+  const res = await call(token, "github", "GET", `https://api.github.com/repos/${repo}/contents/${encoded}`);
+  if (!res.ok) return fail(res, "github", `file ${path}`);
+  const body = (await res.json()) as {
+    name: string;
+    path: string;
+    size: number;
+    content?: string;
+    encoding?: string;
+  };
+  const size = body.size ?? 0;
+  if (size > 400_000 || (!body.content && size > 0)) {
+    return { name: body.name, path: body.path, size, tooLarge: true };
+  }
+  const text = body.encoding === "base64" ? Buffer.from(body.content ?? "", "base64").toString("utf8") : (body.content ?? "");
+  return { name: body.name, path: body.path, size, text: text.slice(0, 200_000) };
+}
+
+export async function githubIssues(userId: string, repo: string, limit = 20): Promise<unknown[]> {
+  const token = await needToken(userId, "github");
+  const res = await call(
+    token,
+    "github",
+    "GET",
+    `https://api.github.com/repos/${encodeURIComponent(repo)}/issues?state=open&per_page=${limit}`,
+  );
+  if (!res.ok) return fail(res, "github", "issues");
+  const issues = (await res.json()) as {
+    number: number;
+    title: string;
+    user?: { login: string } | null;
+    created_at: string;
+    html_url?: string;
+    pull_request?: unknown;
+  }[];
+  return issues
+    .filter((i) => !i.pull_request)
+    .map((i) => ({
+      number: i.number,
+      title: i.title,
+      author: i.user?.login ?? null,
+      createdAt: i.created_at,
+      url: i.html_url ?? null,
+    }));
+}
+
+export async function githubCommits(userId: string, repo: string, limit = 20): Promise<unknown[]> {
+  const token = await needToken(userId, "github");
+  const res = await call(
+    token,
+    "github",
+    "GET",
+    `https://api.github.com/repos/${encodeURIComponent(repo)}/commits?per_page=${limit}`,
+  );
+  if (!res.ok) return fail(res, "github", "commits");
+  const commits = (await res.json()) as {
+    sha: string;
+    commit: { message: string; author?: { name?: string; date?: string } | null };
+    html_url?: string;
+  }[];
+  return commits.map((c) => ({
+    sha: c.sha.slice(0, 7),
+    message: (c.commit.message ?? "").split("\n")[0],
+    author: c.commit.author?.name ?? null,
+    date: c.commit.author?.date ?? null,
+    url: c.html_url ?? null,
   }));
 }
 
@@ -265,17 +380,67 @@ export async function vercelDeployments(userId: string, limit = 20): Promise<unk
   const res = await call(token, "vercel", "GET", `https://api.vercel.com/v6/deployments?limit=${limit}`);
   if (!res.ok) return fail(res, "vercel", "deployments");
   const body = (await res.json()) as {
-    deployments?: { uid: string; name: string; state: string; created?: number }[];
+    deployments?: {
+      uid: string;
+      name: string;
+      state: string;
+      created?: number;
+      url?: string;
+      environment?: string;
+      meta?: Record<string, string>;
+    }[];
   };
   return (body.deployments ?? []).map((d) => ({
     id: d.uid,
     project: d.name,
     state: d.state,
     createdAt: d.created ? new Date(d.created * 1000).toISOString() : null,
+    url: d.url ? `https://${d.url}` : null,
+    environment: d.environment ?? null,
+    framework: d.meta?.framework ?? null,
   }));
 }
 
-export async function notionSearch(userId: string, term: string, limit = 10): Promise<unknown[]> {
+export async function vercelProjects(userId: string, limit = 20): Promise<unknown[]> {
+  const token = await needToken(userId, "vercel");
+  const res = await call(token, "vercel", "GET", `https://api.vercel.com/v9/projects?limit=${limit}`);
+  if (!res.ok) return fail(res, "vercel", "projects");
+  const body = (await res.json()) as {
+    projects?: {
+      id: string;
+      name: string;
+      framework?: string | null;
+      updatedAt?: number;
+      latestDeployment?: { state?: string; created?: number; url?: string } | null;
+    }[];
+  };
+  return (body.projects ?? []).map((p) => ({
+    id: p.id,
+    name: p.name,
+    framework: p.framework ?? null,
+    updatedAt: p.updatedAt ? new Date(p.updatedAt * 1000).toISOString() : null,
+    state: p.latestDeployment?.state ?? null,
+    lastDeployed: p.latestDeployment?.created ? new Date(p.latestDeployment.created * 1000).toISOString() : null,
+    url: p.latestDeployment?.url ? `https://${p.latestDeployment.url}` : null,
+  }));
+}
+
+function notionPlain(rich: { plain_text?: string }[] | undefined): string {
+  return (rich ?? []).map((r) => r.plain_text ?? "").join("");
+}
+
+function notionTitleOf(result: Record<string, unknown>): string {
+  const props = (result["properties"] ?? {}) as Record<string, { title?: { plain_text?: string }[] }>;
+  for (const value of Object.values(props)) {
+    if (Array.isArray(value?.title) && value.title.length) return notionPlain(value.title);
+  }
+  if (Array.isArray(result["title"])) return notionPlain(result["title"] as { plain_text?: string }[]);
+  const child = result["child_page"] as { title?: string } | undefined;
+  if (child?.title) return child.title;
+  return "Untitled";
+}
+
+export async function notionSearch(userId: string, term: string, limit = 20): Promise<unknown[]> {
   const token = await needToken(userId, "notion");
   const res = await call(token, "notion", "POST", "https://api.notion.com/v1/search", {
     query: term,
@@ -283,24 +448,141 @@ export async function notionSearch(userId: string, term: string, limit = 10): Pr
   });
   if (!res.ok) return fail(res, "notion", "search");
   const body = (await res.json()) as {
-    results?: { id: string; url: string; last_edited_time: string }[];
+    results?: {
+      id: string;
+      object: string;
+      url: string;
+      last_edited_time: string;
+      icon?: { emoji?: string; type?: string } | null;
+    }[];
   };
-  return (body.results ?? []).map((r) => ({ id: r.id, url: r.url, lastEdited: r.last_edited_time }));
+  return (body.results ?? []).map((r) => ({
+    id: r.id,
+    title: notionTitleOf(r as unknown as Record<string, unknown>),
+    icon: r.icon?.emoji ?? (r.object === "database" ? "🗂️" : "📄"),
+    url: r.url,
+    lastEdited: r.last_edited_time,
+  }));
 }
 
-export async function calBookings(userId: string, limit = 10): Promise<unknown[]> {
+export interface NotionLine {
+  type: "h1" | "h2" | "h3" | "p" | "ul" | "ol" | "todo" | "quote" | "code" | "callout" | "hr" | "page" | "media";
+  text: string;
+  checked?: boolean;
+  lang?: string;
+}
+
+/** One page's content, flattened to readable lines (headings, lists, todos…). */
+export async function notionPage(
+  userId: string,
+  pageId: string,
+): Promise<{ id: string; title: string; url: string; lines: NotionLine[] }> {
+  const token = await needToken(userId, "notion");
+  const pageRes = await call(token, "notion", "GET", `https://api.notion.com/v1/pages/${encodeURIComponent(pageId)}`);
+  if (!pageRes.ok) return fail(pageRes, "notion", "page fetch");
+  const page = (await pageRes.json()) as Record<string, unknown>;
+  const res = await call(
+    token,
+    "notion",
+    "GET",
+    `https://api.notion.com/v1/blocks/${encodeURIComponent(pageId)}/children?page_size=100`,
+  );
+  if (!res.ok) return fail(res, "notion", "page content");
+  const body = (await res.json()) as { results?: Record<string, unknown>[] };
+  const lines: NotionLine[] = [];
+  for (const block of body.results ?? []) {
+    const type = String(block["type"] ?? "");
+    const b = (block[type] ?? {}) as Record<string, unknown> & {
+      rich_text?: { plain_text?: string }[];
+      checked?: boolean;
+      language?: string;
+      title?: string;
+      name?: string;
+    };
+    const text = notionPlain(b.rich_text);
+    switch (type) {
+      case "heading_1":
+        lines.push({ type: "h1", text });
+        break;
+      case "heading_2":
+        lines.push({ type: "h2", text });
+        break;
+      case "heading_3":
+        lines.push({ type: "h3", text });
+        break;
+      case "bulleted_list_item":
+        lines.push({ type: "ul", text });
+        break;
+      case "numbered_list_item":
+        lines.push({ type: "ol", text });
+        break;
+      case "to_do":
+        lines.push({ type: "todo", text, checked: Boolean(b.checked) });
+        break;
+      case "toggle":
+        lines.push({ type: "ul", text });
+        break;
+      case "quote":
+        lines.push({ type: "quote", text });
+        break;
+      case "code":
+        lines.push({ type: "code", text, lang: b.language ?? undefined });
+        break;
+      case "callout":
+        lines.push({ type: "callout", text });
+        break;
+      case "divider":
+        lines.push({ type: "hr", text: "" });
+        break;
+      case "child_page":
+        lines.push({ type: "page", text: b.title ?? "Child page" });
+        break;
+      case "image":
+      case "file":
+      case "pdf":
+      case "video":
+        lines.push({ type: "media", text: b.name ?? type });
+        break;
+      case "paragraph":
+        if (text.trim()) lines.push({ type: "p", text });
+        break;
+      default:
+        if (text.trim()) lines.push({ type: "p", text });
+        break;
+    }
+  }
+  return { id: pageId, title: notionTitleOf(page), url: String(page["url"] ?? ""), lines };
+}
+
+export async function calBookings(userId: string, limit = 20): Promise<unknown[]> {
   const token = await needToken(userId, "calcom");
   const res = await call(token, "calcom", "GET", `https://api.cal.com/v2/bookings?status=upcoming&take=${limit}`);
   if (!res.ok) return fail(res, "calcom", "bookings");
   const body = (await res.json()) as {
-    data?: { id: number; title: string; start: string; status: string; attendees?: { name?: string; email?: string }[] }[];
+    data?: {
+      id: number;
+      title: string;
+      start: string;
+      end?: string;
+      status: string;
+      description?: string;
+      duration?: number;
+      location?: string | null;
+      attendees?: { name?: string; email?: string }[];
+      hosts?: { name?: string; username?: string }[];
+    }[];
   };
   return (body.data ?? []).map((b) => ({
     id: b.id,
     title: b.title,
     start: b.start,
+    end: b.end ?? null,
     status: b.status,
-    attendees: (b.attendees ?? []).map((a) => a.name || a.email).filter(Boolean).slice(0, 3),
+    description: (b.description ?? "").slice(0, 160),
+    duration: b.duration ?? null,
+    location: b.location ?? null,
+    attendees: (b.attendees ?? []).map((a) => a.name || a.email).filter(Boolean).slice(0, 4),
+    hosts: (b.hosts ?? []).map((h) => h.name || h.username).filter(Boolean).slice(0, 3),
   }));
 }
 
@@ -308,8 +590,22 @@ export async function elevenVoiceList(userId: string): Promise<unknown[]> {
   const token = await needToken(userId, "elevenlabs");
   const res = await call(token, "elevenlabs", "GET", "https://api.elevenlabs.io/v1/voices");
   if (!res.ok) return fail(res, "elevenlabs", "voices");
-  const body = (await res.json()) as { voices?: { voice_id: string; name: string; labels?: Record<string, string> }[] };
-  return (body.voices ?? []).map((v) => ({ id: v.voice_id, name: v.name, labels: v.labels ?? {} }));
+  const body = (await res.json()) as {
+    voices?: {
+      voice_id: string;
+      name: string;
+      labels?: Record<string, string>;
+      category?: string;
+      preview_url?: string;
+    }[];
+  };
+  return (body.voices ?? []).map((v) => ({
+    id: v.voice_id,
+    name: v.name,
+    labels: v.labels ?? {},
+    category: v.category ?? v.labels?.["category"] ?? null,
+    previewUrl: v.preview_url ?? null,
+  }));
 }
 
 export type TextToSpeechDetail =

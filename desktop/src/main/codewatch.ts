@@ -1,6 +1,6 @@
-// The live code surface for a session: from Claude Code hook payloads.
-// structuredPatch (documented hook field) gives real hunks — exact numbers,
-// +/- lines — so the island shows what the agent is editing right now.
+﻿// The live code surface for a session: from Claude Code hook payloads.
+// structuredPatch (documented hook field) gives real hunks â€” exact numbers,
+// +/- lines â€” so the island shows what the agent is editing right now.
 // Fallbacks: old/new strings for edits, the command itself for shells.
 
 export interface CodeRow {
@@ -17,8 +17,8 @@ export interface CodeView {
   rows: CodeRow[];
 }
 
-const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "replace_file_content"]);
-const WRITE_TOOLS = new Set(["Write", "write_to_file", "NotebookEdit"]);
+const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "replace_file_content", "multi_replace_file_content"]);
+const WRITE_TOOLS = new Set(["Write", "write_file", "write_to_file", "NotebookEdit"]);
 const SHELL_TOOLS = new Set(["Bash", "PowerShell", "run_command"]);
 
 function str(v: unknown): string {
@@ -86,7 +86,7 @@ export function codeViewFrom(
   if (EDIT_TOOLS.has(tool)) {
     const oldText = str(input["old_string"]) || str(input["old_str"]);
     const newText = str(input["new_string"]) || str(input["new_str"]);
-    // Claude Code documents tool_response.structuredPatch — real hunks.
+    // Claude Code documents tool_response.structuredPatch â€” real hunks.
     const patchRows = rowsFromStructuredPatches((toolResponse as { structuredPatch?: unknown } | null | undefined)?.structuredPatch);
     if (patchRows.length > 0) return { file, path: fileRaw ?? "", kind: "diff", rows: patchRows };
     const oldRows = oldText ? numbered(oldText, 1, "del") : [];
@@ -98,3 +98,4 @@ export function codeViewFrom(
 
   return null;
 }
+

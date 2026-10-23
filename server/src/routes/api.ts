@@ -1,6 +1,8 @@
 ﻿import { Router } from "express";
+import type { Response } from "express";
 import { z } from "zod";
 import { requireUser, requireAgent, type AuthedRequest } from "../auth/middleware.js";
+import { config } from "../config.js";
 import { query, one, pool } from "../db/pool.js";
 import { parseIntParam } from "../lib/validate.js";
 import {
@@ -16,6 +18,8 @@ import { notificationService } from "../services/notifications.js";
 import { recentActivity } from "../agents/activity.js";
 import { delegation } from "../agents/delegation.js";
 import { agentRegistry } from "../agents/registry.js";
+import { codingContextFrom, DEFAULT_CODING_AGENT, isCodingAgent } from "../agents/coding.js";
+import { hub } from "../ws/hub.js";
 import { rowToMemory } from "../memory/memory-service.js";
 import * as integrations from "../integrations/service.js";
 import * as friends from "../integrations/friends.js";
@@ -25,7 +29,10 @@ export const api = Router();
 api.use("/auth", (await import("./auth.js")).authRouter);
 
 // Everything below requires a user token and silently scopes by user id.
-api.use((req, res, next) => (req.path === "/auth" ? next() : requireUser(req, res, next)));
+// Agent routes authenticate separately with AGENT_TOKEN (`/agent` router).
+api.use((req, res, next) =>
+  req.path === "/auth" || req.path.startsWith("/agent") ? next() : requireUser(req, res, next),
+);
 
 // â”€â”€ Me / devices / preferences â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -256,7 +263,7 @@ api.get("/tasks/:id", async (req, res) => {
 
 api.post("/tasks", async (req, res) => {
   const schema = z.object({
-    kind: z.enum(["research", "plan", "custom"]).default("custom"),
+    kind: z.enum(["research", "plan", "custom", "coding"]).default("custom"),
     title: z.string().min(1).max(120),
     payload: z.record(z.unknown()).default({}),
   });
@@ -265,24 +272,33 @@ api.post("/tasks", async (req, res) => {
     res.status(400).json({ error: "invalid_request", detail: parsed.error.issues });
     return;
   }
+  const userId = (req as unknown as AuthedRequest).auth.userId;
+  const payload: Record<string, unknown> = {
+    ...(parsed.data.payload as Record<string, unknown>),
+    prompt: parsed.data.payload["prompt"] ?? parsed.data.title,
+  };
+  if (parsed.data.kind === "coding" && payload["agent"] !== undefined && !isCodingAgent(payload["agent"])) {
+    res.status(400).json({ error: "invalid_request", detail: "agent must be claude, opencode or antigravity" });
+    return;
+  }
+  const context =
+    parsed.data.kind === "coding"
+      ? (codingContextFrom(payload, parsed.data.title) as unknown as Record<string, unknown>)
+      : { kind: "generic" };
   const task = await delegation.createTask({
-    userId: (req as unknown as AuthedRequest).auth.userId,
+    userId,
     conversationId: null,
     kind: parsed.data.kind,
     title: parsed.data.title,
-    payload: { ...parsed.data.payload, prompt: parsed.data.payload.prompt ?? parsed.data.title },
-    context: { kind: "generic" },
+    payload,
+    context,
   });
   res.status(201).json(task);
 });
 
 api.delete("/tasks/:id", async (req, res) => {
   const userId = (req as unknown as AuthedRequest).auth.userId;
-  await one(
-    `UPDATE agent_tasks SET status = 'cancelled', updated_at = now()
-     WHERE id = $1 AND user_id = $2 AND status IN ('queued','running') RETURNING id`,
-    [req.params.id, userId],
-  );
+  await delegation.cancelTask(userId, req.params.id);
   res.status(204).end();
 });
 
@@ -409,6 +425,97 @@ api.get("/integrations/elevenlabs/voices", async (req, res) => {
   }
 });
 
+// ── Deep reads — the island browses real content without leaving the app ─────
+
+function integrationFail(res: Response, err: unknown): void {
+  if (err instanceof integrations.NotConfiguredError) {
+    res.status(409).json({ error: "not_configured", service: err.service, message: err.message });
+  } else if (err instanceof integrations.UpstreamError) {
+    res.status(502).json({ error: "upstream", message: err.message });
+  } else {
+    res.status(500).json({ error: "internal", message: (err as Error).message });
+  }
+}
+
+api.get("/integrations/github/contents", async (req, res) => {
+  try {
+    res.json(
+      await integrations.githubContents(
+        (req as unknown as AuthedRequest).auth.userId,
+        String(req.query.repo ?? ""),
+        String(req.query.path ?? ""),
+      ),
+    );
+  } catch (err) {
+    integrationFail(res, err);
+  }
+});
+
+api.get("/integrations/github/file", async (req, res) => {
+  try {
+    res.json(
+      await integrations.githubFile(
+        (req as unknown as AuthedRequest).auth.userId,
+        String(req.query.repo ?? ""),
+        String(req.query.path ?? ""),
+      ),
+    );
+  } catch (err) {
+    integrationFail(res, err);
+  }
+});
+
+api.get("/integrations/github/issues", async (req, res) => {
+  try {
+    res.json(
+      await integrations.githubIssues(
+        (req as unknown as AuthedRequest).auth.userId,
+        String(req.query.repo ?? ""),
+        parseIntParam(req.query.limit as string | undefined, 20),
+      ),
+    );
+  } catch (err) {
+    integrationFail(res, err);
+  }
+});
+
+api.get("/integrations/github/commits", async (req, res) => {
+  try {
+    res.json(
+      await integrations.githubCommits(
+        (req as unknown as AuthedRequest).auth.userId,
+        String(req.query.repo ?? ""),
+        parseIntParam(req.query.limit as string | undefined, 20),
+      ),
+    );
+  } catch (err) {
+    integrationFail(res, err);
+  }
+});
+
+api.get("/integrations/vercel/projects", async (req, res) => {
+  try {
+    res.json(
+      await integrations.vercelProjects(
+        (req as unknown as AuthedRequest).auth.userId,
+        parseIntParam(req.query.limit as string | undefined, 20),
+      ),
+    );
+  } catch (err) {
+    integrationFail(res, err);
+  }
+});
+
+api.get("/integrations/notion/page", async (req, res) => {
+  try {
+    res.json(
+      await integrations.notionPage((req as unknown as AuthedRequest).auth.userId, String(req.query.id ?? "")),
+    );
+  } catch (err) {
+    integrationFail(res, err);
+  }
+});
+
 // Text-to-speech: spoken replies for phone/desktop. MP3 passthrough.
 api.post("/voice/stt", async (req, res) => {
   const userId = (req as unknown as AuthedRequest).auth.userId;
@@ -522,6 +629,169 @@ agentApi.get("/tasks", async (req, res) => {
   const frames = await delegation.tryClaim(String(req.query.agent ?? "hosted-agent"), kinds);
   res.json(frames);
 });
+
+const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Agents carry no user identity. Pick the single user with a live desktop, or
+ * the pinned HI_AGENT_USER_ID. Anything ambiguous is refused instead of
+ * silently running code in the wrong person's home directory.
+ */
+async function resolveAgentUser(explicit?: unknown): Promise<string | null> {
+  const wanted = typeof explicit === "string" ? explicit.trim() : "";
+  if (wanted) {
+    // A pinned agent may not retarget code execution at somebody else's PC.
+    if (config.agentUserId && wanted !== config.agentUserId) return null;
+    const row = await one<{ id: string }>(`SELECT id FROM users WHERE id = $1`, [wanted]);
+    return row?.id ?? null;
+  }
+  if (config.agentUserId) {
+    const row = await one<{ id: string }>(`SELECT id FROM users WHERE id = $1`, [config.agentUserId]);
+    if (!row) return null;
+    return row.id;
+  }
+  const online = hub.onlineDesktopUserIds();
+  return online.length === 1 ? online[0]! : null;
+}
+
+async function taskWithSteps(taskId: string): Promise<{ task: Record<string, unknown>; steps: unknown[] } | null> {
+  const task = await one<Record<string, unknown>>(`SELECT * FROM agent_tasks WHERE id = $1`, [taskId]);
+  if (!task) return null;
+  const steps = await query(
+    `SELECT id, level, message, agent, created_at FROM agent_activity
+     WHERE task_id = $1 ORDER BY id ASC LIMIT 400`,
+    [taskId],
+  );
+  return { task, steps };
+}
+
+async function waitForTask(taskId: string, seconds: number): Promise<Awaited<ReturnType<typeof taskWithSteps>>> {
+  const deadline = Date.now() + Math.max(0, seconds) * 1000;
+  for (;;) {
+    const snapshot = await taskWithSteps(taskId);
+    if (!snapshot) return null;
+    const status = String(snapshot.task["status"] ?? "");
+    if (TERMINAL.has(status) || Date.now() >= deadline) return snapshot;
+    await sleep(750);
+  }
+}
+
+const codingCreateSchema = z.object({
+  kind: z.literal("coding").default("coding"),
+  title: z.string().min(1).max(120).optional(),
+  userId: z.string().uuid().optional(),
+  prompt: z.string().min(1).max(12_000),
+  agent: z.enum(["claude", "opencode", "antigravity"]).default(DEFAULT_CODING_AGENT),
+  cwd: z.string().max(1024).optional(),
+  timeoutMs: z.number().int().min(10_000).max(60 * 60_000).optional(),
+  wait: z.number().int().min(0).max(300).default(0),
+});
+
+async function createCodingTaskForAgent(
+  input: z.infer<typeof codingCreateSchema>,
+): Promise<{ ok: true; userId: string; taskId: string } | { ok: false; status: number; error: string }> {
+  const userId = await resolveAgentUser(input.userId);
+  if (!userId) {
+    return {
+      ok: false,
+      status: 409,
+      error:
+        "cannot resolve the target user: set HI_AGENT_USER_ID or keep exactly one desktop island online",
+    };
+  }
+  if (!hub.hasDesktop(userId)) {
+    return {
+      ok: false,
+      status: 409,
+      error: "the target user's desktop island is offline; open Hi on that PC",
+    };
+  }
+  const payload = {
+    prompt: input.prompt,
+    agent: input.agent,
+    ...(input.cwd ? { cwd: input.cwd } : {}),
+    ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
+  };
+  const context = codingContextFrom(payload, input.prompt);
+  const task = await delegation.createTask({
+    userId,
+    conversationId: null,
+    kind: "coding",
+    title: input.title ?? `Code: ${input.prompt.replace(/\s+/g, " ").slice(0, 64)}`,
+    payload,
+    context: context as unknown as Record<string, unknown>,
+  });
+  return { ok: true, userId, taskId: task.id };
+}
+
+/**
+ * Start a real coding task on the user's desktop (Claude Code, OpenCode or
+ * Antigravity). Returns immediately by default; `wait` long-polls for a result.
+ */
+agentApi.post("/tasks", async (req, res) => {
+  const parsed = codingCreateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "invalid_request", detail: parsed.error.issues });
+    return;
+  }
+  const created = await createCodingTaskForAgent(parsed.data);
+  if (!created.ok) {
+    res.status(created.status).json({ error: "unavailable", message: created.error });
+    return;
+  }
+  const snapshot = parsed.data.wait
+    ? await waitForTask(created.taskId, parsed.data.wait)
+    : await taskWithSteps(created.taskId);
+  res.status(201).json({ ...(snapshot ?? { taskId: created.taskId }), userId: created.userId });
+});
+
+/** Read one task and its live activity trail; `wait` long-polls until terminal. */
+agentApi.get("/tasks/:id", async (req, res) => {
+  const wait = Math.min(300, Math.max(0, Number(req.query.wait ?? 0) || 0));
+  const snapshot = await waitForTask(String(req.params.id), wait);
+  if (!snapshot) {
+    res.status(404).json({ error: "not_found" });
+    return;
+  }
+  res.json(snapshot);
+});
+
+/** Cancel a queued/running task (stops the local process tree for coding). */
+agentApi.delete("/tasks/:id", async (req, res) => {
+  const row = await one<{ user_id: string }>(`SELECT user_id FROM agent_tasks WHERE id = $1`, [
+    String(req.params.id),
+  ]);
+  if (!row) {
+    res.status(404).json({ error: "not_found" });
+    return;
+  }
+  const cancelled = await delegation.cancelTask(row.user_id, String(req.params.id));
+  res.json({ cancelled });
+});
+
+/** Shortcut: start a coding task and optionally wait for it. */
+agentApi.post("/coding", async (req, res) => {
+  const parsed = codingCreateSchema.safeParse({ ...req.body, kind: "coding" });
+  if (!parsed.success) {
+    res.status(400).json({ error: "invalid_request", detail: parsed.error.issues });
+    return;
+  }
+  const created = await createCodingTaskForAgent(parsed.data);
+  if (!created.ok) {
+    res.status(created.status).json({ error: "unavailable", message: created.error });
+    return;
+  }
+  const snapshot = parsed.data.wait
+    ? await waitForTask(created.taskId, parsed.data.wait)
+    : await taskWithSteps(created.taskId);
+  res.status(201).json({ ...(snapshot ?? { taskId: created.taskId }), userId: created.userId });
+});
+
+
 
 // Push task updates/results from hosted agents over plain HTTPS.
 agentApi.post("/events", async (req, res) => {

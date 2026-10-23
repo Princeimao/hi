@@ -34,7 +34,13 @@ export function ensureHookLauncher(): void {
     fs.mkdirSync(binDir(), { recursive: true, mode: 0o700 });
     const targets = hookCliCommand();
     if (process.platform === "win32") {
-      fs.writeFileSync(hookExePath(), `@echo off\r\nset ELECTRON_RUN_AS_NODE=\r\n${targets}\r\n`, "utf8");
+      // ELECTRON_RUN_AS_NODE=1 keeps the agent's stdin payload: Electron's GUI
+      // subsystem drops it on Windows, which made every hook arrive empty.
+      const body = `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n${targets}\r\n`;
+      fs.writeFileSync(hookExePath(), body, "utf8");
+      const alias = hookCmdPath();
+      fs.mkdirSync(path.dirname(alias), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(alias, body, "utf8");
     } else {
       fs.writeFileSync(hookExePath(), `#!/bin/sh\nexec ${targets}\n`, "utf8");
       fs.chmodSync(hookExePath(), 0o755);
@@ -50,9 +56,17 @@ export function ensureHookLauncher(): void {
 /// app directory too; a packaged app does not.
 export function hookCliCommand(): string {
   const exe = process.env["HI_TEST_HOOK_EXE"] ?? process.execPath;
-  if (appIsPackaged()) return `"${exe}" --hook %*`;
-  const appDir = appDirGuess() ? `"${appDirGuess()}"` : "";
-  return appDir ? `"${exe}" ${appDir} --hook %*` : `"${exe}" --hook %*`;
+  // Hook mode runs as plain Node (ELECTRON_RUN_AS_NODE=1 in the launcher):
+  // Electron's GUI subsystem does not receive the agent's stdin payload on
+  // Windows, and this path never needs an Electron window.
+  if (appIsPackaged()) {
+    const resources = process.resourcesPath ?? "";
+    const entry = path.join(resources, "app.asar", "dist-electron", "hook-entry.js");
+    return `"${exe}" "${entry}" --hook %*`;
+  }
+  const appDir = appDirGuess();
+  if (!appDir) return `"${exe}" --hook %*`;
+  return `"${exe}" "${path.join(appDir, "dist-electron", "hook-entry.js")}" --hook %*`;
 }
 
 function appIsPackaged(): boolean {
@@ -75,8 +89,18 @@ function appDirGuess(): string | null {
 
 /// The relay command for the running OS, for `args` — the launcher path, one
 /// shell word, plus the event name.
+/// A cmd.exe-safe path: 8.3 short names have no spaces or quotes, so agents
+/// that run hooks through cmd never have to quote (Antigravity mis-escapes
+/// `"C:\Users\First Last\..."` into `\"...\"`). Falls back to the long path.
+export function hookCmdPath(): string {
+  if (process.platform !== "win32") return hookExePath();
+  const base = process.env["PUBLIC"] ?? "C:\\Users\\Public";
+  return path.join(base, "Hi", "bin", "hi-hook.cmd");
+}
+
 export function relayCommand(shell: Shell, args: string): string {
-  return new Relay(hookExePath(), process.platform === "win32").command(shell, args);
+  const exe = process.platform === "win32" && shell === "cmd" ? hookCmdPath() : hookExePath();
+  return new Relay(exe, process.platform === "win32").command(shell, args);
 }
 
 export { Relay, Shell, quoteFor };

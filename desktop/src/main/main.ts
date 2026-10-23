@@ -2,7 +2,7 @@
 // relay (pipe-server), the approval lifecycle (registry) and the settings
 // installers all run here; the renderer only renders, over a typed preload API.
 
-import { app, BrowserWindow, ipcMain, screen, session } from "electron";
+import { app, BrowserWindow, ipcMain, screen, session, shell } from "electron";
 import os from "node:os";
 import path from "node:path";
 import { SessionRegistry, type RegistryAction } from "./registry";
@@ -18,6 +18,7 @@ import { ensureHookLauncher, homeDir } from "./settings";
 import * as claudeHooks from "./hook-installer";
 import * as agentInstallers from "./agent-installer";
 import { BackendRelay } from "./backend-relay";
+import { CodingRunner, type CodingAgentId, type CodingTaskAssign } from "./coding-runner";
 import { pushActionNotifications, wireNotifications, type OpenCard } from "./notifier";
 
 // ── Hook mode: `hi-hook.cmd <event> [--agent x]` ─────────────────────────────
@@ -45,6 +46,7 @@ function onQuit(): void {
   if (quitting) return;
   quitting = true;
   relay.stop();
+  codingRunner?.stopAll();
   registry.dispose();
   broker.clear();
   app.exit(0);
@@ -54,6 +56,83 @@ let registry = new SessionRegistry(() => {});
 let broker = new PermissionBroker();
 let relay = new BackendRelay();
 let pipe: { stop(): void } | null = null;
+let codingRunner: CodingRunner | null = null;
+
+/** Coding tasks assigned by an Agentverse agent, for the synthetic island pill. */
+const codingSessions = new Map<string, { agent: CodingAgentId; cwd: string; prompt: string }>();
+
+function codingHook(
+  taskId: string,
+  hook_event_name: string,
+  extra: Partial<import("./registry").HookPayload> = {},
+): void {
+  const meta = codingSessions.get(taskId);
+  registry.ingest({
+    hook_event_name,
+    session_id: taskId,
+    cwd: meta?.cwd ?? os.homedir(),
+    ...(meta && meta.agent !== "claude" ? { hi_agent: meta.agent } : {}),
+    ...extra,
+  });
+}
+
+function startCodingTask(request: CodingTaskAssign): void {
+  const runner = codingRunner;
+  if (!runner) return;
+  codingSessions.set(request.taskId, {
+    agent: request.agent,
+    cwd: request.cwd ?? os.homedir(),
+    prompt: request.prompt,
+  });
+  codingHook(request.taskId, "SessionStart");
+  codingHook(request.taskId, "UserPromptSubmit", { prompt: request.prompt.slice(0, 400) });
+
+  const outcome = runner.start(request);
+  if (!outcome.ok) {
+    const message = outcome.error ?? "could not start the coding agent";
+    relay.codingError(request.taskId, message);
+    codingHook(request.taskId, "StopFailure", { message });
+    codingSessions.delete(request.taskId);
+    return;
+  }
+  if (outcome.cwd) {
+    const meta = codingSessions.get(request.taskId);
+    if (meta) meta.cwd = outcome.cwd;
+  }
+}
+
+function cancelCodingTask(taskId: string): void {
+  codingRunner?.cancel(taskId);
+  codingHook(taskId, "Interrupt");
+}
+
+function createCodingRunner(): CodingRunner {
+  return new CodingRunner({
+    onStep(taskId, label) {
+      relay.codingStep(taskId, label);
+      codingHook(taskId, "PreToolUse", {
+        tool_name: "Bash",
+        tool_input: { command: label.replace(/^Uses /, "").slice(0, 80) },
+      });
+    },
+    onOutput(taskId, text) {
+      relay.codingOutput(taskId, text);
+    },
+    onHeartbeat(taskId, progress) {
+      relay.codingHeartbeat(taskId, progress);
+    },
+    onResult(taskId, result, summary) {
+      relay.codingResult(taskId, result as unknown as Record<string, unknown>, summary);
+      codingHook(taskId, "Stop", { last_assistant_message: summary });
+      codingSessions.delete(taskId);
+    },
+    onError(taskId, error) {
+      relay.codingError(taskId, error);
+      codingHook(taskId, "StopFailure", { message: error });
+      codingSessions.delete(taskId);
+    },
+  });
+}
 
 async function boot(): Promise<void> {
   ensureHookLauncher();
@@ -66,6 +145,7 @@ async function boot(): Promise<void> {
 
   broker = new PermissionBroker();
   registry = new SessionRegistry(handleActions);
+  codingRunner = createCodingRunner();
   pipe = startPipeRelay(registry, broker);
   startRelay();
 
@@ -104,6 +184,17 @@ function startRelay(): void {
         mainWindow?.webContents.send("hub:event", event);
       } catch {
         // window gone mid-event
+      }
+    },
+    (frame) => {
+      if (frame.type === "coding.task.assign") {
+        const assign = frame as unknown as CodingTaskAssign;
+        if (assign.taskId && assign.prompt && assign.agent) startCodingTask(assign);
+        return;
+      }
+      if (frame.type === "coding.task.cancel") {
+        const taskId = String((frame as { taskId?: unknown }).taskId ?? "");
+        if (taskId) cancelCodingTask(taskId);
       }
     },
   );
@@ -417,6 +508,17 @@ function setupIpc(): void {
     relay.stopChat(String(conversationId), String(messageId));
   });
   ipcMain.handle("cwd:home", () => os.homedir());
+  // Open an https URL in the system browser (integration "create token" deep links).
+  ipcMain.handle("shell:open-external", (_e, raw: string) => {
+    try {
+      const url = new URL(String(raw));
+      if (url.protocol !== "https:" && url.protocol !== "http:") return false;
+      void shell.openExternal(url.toString());
+      return true;
+    } catch {
+      return false;
+    }
+  });
   // Native dock controls: system media keys + WinRT track info.
   ipcMain.on("media:action", (_e, kind: string, steps: number) => {
     const known = ["prev", "playPause", "next", "volDown", "volUp", "mute"];

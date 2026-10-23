@@ -1,10 +1,10 @@
-// Port of mu/windows/hook/src/main.rs — the relay that agents run: stdin JSON
+﻿// Port of mu/windows/hook/src/main.rs â€” the relay that agents run: stdin JSON
 // in, one connection to the island's pipe, then the agent's own stdout contract
 // (reply.ts) for whatever comes back. `--agent <name>` says whose contract that
 // is, `--statusline` relays Claude Code's plan limits and exits fast.
 //
 // The one rule: nothing that allows anything is printed without a decision a
-// human clicked. With no decision, silence or "{}" — never an allow.
+// human clicked. With no decision, silence or "{}" â€” never an allow.
 
 // This module runs inside the Electron app's main process before anything
 // else: main.ts checks argv first and hands control here.
@@ -13,6 +13,9 @@ const CONNECT_TIMEOUT_MS = 300;
 const REPLY_TIMEOUT_MS = 110_000;
 const MAX_STDIN = 1 << 20;
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import net from "node:net";
 import { pipeName } from "./pipe-server";
 import { normalizeEvent, normalizeFields, refineEvent } from "./adapters";
@@ -27,16 +30,41 @@ export interface HookCliArgs {
 export function parseHookArgs(argv: string[]): HookCliArgs | null {
   const i = argv.indexOf("--hook");
   if (i === -1) return null;
-  const event = argv[i + 1] ?? "";
+  // The launcher prepends `--hook`, and some installers put `--agent <name>`
+  // before the event. Walk the flags instead of trusting argv[i + 1], and
+  // tolerate a second `--hook` (plugins that pass it themselves).
+  let event = "";
   let agent = "";
-  const a = argv.indexOf("--agent");
-  if (a !== -1) agent = argv[a + 1] ?? "";
+  for (let j = i + 1; j < argv.length; j++) {
+    const arg = argv[j] ?? "";
+    if (arg === "--hook" || arg === "--statusline") continue;
+    if (arg === "--agent") {
+      agent = argv[j + 1] ?? "";
+      j++;
+      continue;
+    }
+    if (!event) event = arg.replace(/^--/, "");
+  }
   const statusline = argv.includes("--statusline");
-  return { event: event.replace(/^--/, ""), agent, statusline };
+  return { event, agent, statusline };
 }
 
 export async function runHookCli(args: HookCliArgs): Promise<number> {
+  const debug = process.env["HI_HOOK_DEBUG"];
+  const log = (line: string): void => {
+    if (!debug) return;
+    try {
+      fs.appendFileSync(path.join(os.tmpdir(), "hi-hook-debug.log"), `${new Date().toISOString()} ${line}\n`);
+    } catch {}
+  };
+  log(`start event=${args.event} agent=${args.agent} statusline=${args.statusline}`);
   const payload = await readStdin(MAX_STDIN);
+  log(`stdin ${payload ? "ok" : "empty"}${payload ? ` keys=${Object.keys(payload).join(",")}` : ""}`);
+  if (payload) {
+    log(
+      `tool=${String(payload["tool_name"] ?? "")} input=${JSON.stringify(payload["tool_input"] ?? null).slice(0, 600)}`,
+    );
+  }
   if (payload === null) return 0;
 
   if (args.statusline) {
@@ -47,6 +75,9 @@ export async function runHookCli(args: HookCliArgs): Promise<number> {
   }
 
   normalizeFields(payload, (key) => process.env[key]);
+  log(
+    `normalized tool=${String(payload["tool_name"] ?? "")} input=${JSON.stringify(payload["tool_input"] ?? null).slice(0, 600)}`,
+  );
   const event = refineEvent(normalizeEvent(args.event || ""), payload);
   if (!event) {
     // Without an event the payload is not actionable; silence.
@@ -122,7 +153,7 @@ export async function readStdin(max: number): Promise<Record<string, unknown> | 
       complete = true;
       done();
     });
-    // Timeout: leave `complete` false — a partial body is not actionable.
+    // Timeout: leave `complete` false â€” a partial body is not actionable.
     setTimeout(done, 1_000);
   });
   if (!complete || buf.length === 0) return null;
@@ -141,16 +172,15 @@ export async function readStdin(max: number): Promise<Record<string, unknown> | 
 
 /// Sends the payload by connecting to the island's pipe. Every payload is one
 /// newline-terminated line. `onDecision` receives the bare word or the answers
-/// JSON the island writes back — or nothing, when nobody acted on the card.
+/// JSON the island writes back â€” or nothing, when nobody acted on the card.
 async function forward(
   agent: string,
   event: string,
   payload: Record<string, unknown>,
   onDecision?: (d: string) => void,
 ): Promise<void> {
-  void agent;
   const name = pipeName();
-  const body = JSON.stringify({ ...payload, hook_event_name: event }) + "\n";
+  const body = JSON.stringify({ ...payload, hook_event_name: event, ...(agent ? { hi_agent: agent } : {}) }) + "\n";
   await new Promise<void>((resolve) => {
     let settled = false;
     const done = () => {
@@ -201,3 +231,6 @@ async function forward(
     });
   });
 }
+
+
+

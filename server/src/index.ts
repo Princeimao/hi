@@ -82,6 +82,11 @@ delegation.onTaskFinalized(async (task) => {
 const server = http.createServer(app);
 hub.attach(server, handleClientFrame);
 
+// Desktop coding frames (task progress/result) are authenticated by the device
+// socket; the broker checks task ownership before touching any row.
+const { codingBroker } = await import("./agents/coding.js");
+hub.setCodingFrameHandler((userId, frame) => codingBroker.handleFrame(userId, frame));
+
 await migrate().catch((err) => {
   logger.error(`[hi] migration failed: ${(err as Error).message}`);
   process.exit(1);

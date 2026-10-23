@@ -90,7 +90,33 @@ export type TaskStatus =
   | "failed"
   | "cancelled";
 
-export type TaskKind = "chat" | "research" | "plan" | "memory" | "friend" | "custom";
+export type TaskKind =
+  | "chat"
+  | "research"
+  | "plan"
+  | "memory"
+  | "friend"
+  | "coding"
+  | "custom";
+
+/** Local coding CLIs the desktop island can drive for remote agents. */
+export type CodingAgentId = "claude" | "opencode" | "antigravity";
+
+export const CODING_AGENTS: readonly CodingAgentId[] = [
+  "claude",
+  "opencode",
+  "antigravity",
+];
+
+/** What a remote agent asks the desktop to run. */
+export interface CodingRequest {
+  prompt: string;
+  agent?: CodingAgentId;
+  /** Must live under the desktop's allowed workspace roots. */
+  cwd?: string;
+  /** Hard wall-clock limit for one run. */
+  timeoutMs?: number;
+}
 
 export interface AgentTask {
   id: string;
@@ -243,7 +269,10 @@ export type ServerEvent =
   | { type: "coding.session"; session: CodingSession }
   | { type: "coding.session.removed"; pillId: string }
   | { type: "coding.approval"; approval: CodingApproval }
-  | { type: "coding.approval.dropped"; requestId: string; reason: string }   | { type: "chat.tool"; tool: string; label: string; ok: boolean; reason?: string }
+  | { type: "coding.approval.dropped"; requestId: string; reason: string }
+  // Live stdout/stderr from a remote coding task (never persisted).
+  | { type: "coding.task.output"; taskId: string; text: string }
+  | { type: "chat.tool"; tool: string; label: string; ok: boolean; reason?: string }
   | { type: "chat.tool.result"; tool: string; label: string; ok: boolean; output: string; reason?: string } | { type: "chat.timer"; seconds: number } | { type: "todo.created"; todo: { id: string; text: string; done: boolean; source: string; created_at: string } } | { type: "todo.updated"; todo: { id: string; text: string; done: boolean; source: string; created_at: string } } | { type: "todo.deleted"; id: string } | { type: "coding.decision"; requestId: string; decision: "allow" | "deny"; answers?: Record<string, string> };
 
 /** A single activity log line from the agent system, persisted in the trail. */
@@ -336,6 +365,14 @@ export type TaskAssignment = {
         memories: { kind: string; content: string }[];
         /** Output of an executed tool (integration or Agentverse friend). */
         tools?: string;
+      }
+    /** Coding context: the desktop island runs the CLI, not an agent. */
+    | {
+        kind: "coding";
+        prompt: string;
+        agent: CodingAgentId;
+        cwd: string | null;
+        timeoutMs: number;
       }
     | { kind: "generic" };
 };

@@ -19,6 +19,9 @@ Configure BACKEND_URL (the public URL of your backend) and AGENT_TOKEN below
 or leave them to the environment; Agentverse exposes env vars set in the UI.
 """
 
+import json as _json
+import re
+import time
 from os import getenv
 
 import requests
@@ -101,6 +104,116 @@ CHAT_SYSTEM = (
     "and useful; use light markdown."
 )
 
+CODING_INTENT = re.compile(
+    r"\b(implement|refactor|"
+    r"fix (?:the )?(?:bug|build|tests?|type ?errors?)|"
+    r"write (?:a |the )?(?:script|function|component|feature|test)|"
+    r"add (?:a |the )?(?:feature|function|component|test)|"
+    r"run (?:the )?tests|"
+    r"use (?:claude code|opencode|antigravity))\b",
+    re.IGNORECASE,
+)
+AGENT_HINTS = (
+    ("opencode", re.compile(r"\bopencode\b", re.IGNORECASE)),
+    ("antigravity", re.compile(r"\bantigravity\b", re.IGNORECASE)),
+)
+AGENT_LABELS = {"claude": "Claude Code", "opencode": "OpenCode", "antigravity": "Antigravity"}
+
+
+def _coding_agent(text: str) -> str:
+    for agent, pattern in AGENT_HINTS:
+        if pattern.search(text):
+            return agent
+    return "claude"
+
+
+def _start_coding(prompt: str, agent: str) -> dict:
+    resp = requests.post(
+        f"{BACKEND_URL}/api/agent/tasks",
+        json={"kind": "coding", "prompt": prompt, "agent": agent},
+        headers=_headers(),
+        timeout=40,
+    )
+    if resp.status_code >= 400:
+        detail = ""
+        try:
+            body = resp.json()
+            detail = body.get("message") or body.get("error") or ""
+        except ValueError:
+            detail = resp.text[:200]
+        raise RuntimeError(detail or f"coding request failed ({resp.status_code})")
+    return resp.json()
+
+
+def _coding_snapshot(task_id: str) -> dict:
+    resp = requests.get(
+        f"{BACKEND_URL}/api/agent/tasks/{task_id}", headers=_headers(), timeout=40
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"could not read coding task ({resp.status_code})")
+    return resp.json()
+
+
+def _coding_text(snapshot: dict) -> str:
+    task = snapshot.get("task") or {}
+    result = task.get("result") or {}
+    if isinstance(result, str):
+        try:
+            result = _json.loads(result)
+        except ValueError:
+            return result
+    if isinstance(result, dict):
+        output = result.get("output") or result.get("content") or result.get("summary")
+        if isinstance(output, str) and output.strip():
+            return output.strip()
+    return str(task.get("error") or task.get("summary") or "").strip()
+
+
+def reply_via_coding(task, text: str) -> None:
+    agent = _coding_agent(text)
+    label = AGENT_LABELS.get(agent, agent)
+    emit({"type": "task.step", "taskId": task["id"], "label": f"Asking {label} on your desktop"})
+    try:
+        started = _start_coding(text, agent)
+    except Exception as err:  # noqa: BLE001
+        emit({"type": "task.error", "taskId": task["id"], "error": f"coding failed: {err}"})
+        return
+
+    coding_task_id = str((started.get("task") or {}).get("id") or "")
+    if not coding_task_id:
+        emit({"type": "task.error", "taskId": task["id"], "error": "no coding task id returned"})
+        return
+
+    snapshot = started
+    status = str((snapshot.get("task") or {}).get("status") or "")
+    deadline = time.time() + 45
+    while status not in ("completed", "failed", "cancelled") and time.time() < deadline:
+        time.sleep(3)
+        try:
+            snapshot = _coding_snapshot(coding_task_id)
+        except Exception:  # noqa: BLE001
+            break
+        status = str((snapshot.get("task") or {}).get("status") or "")
+
+    if status == "completed":
+        body = f"Done with {label}.\n\n{_coding_text(snapshot) or 'The task finished.'}"
+    elif status in ("failed", "cancelled"):
+        body = f"{label} {status}.\n\n{_coding_text(snapshot) or 'No details were reported.'}"
+    else:
+        body = (
+            f"Started {label} on your desktop (task {coding_task_id[:8]}). It is still "
+            "running; live progress is on your island and the result will land in your tasks."
+        )
+    emit({"type": "text.delta", "taskId": task["id"], "text": body})
+    emit(
+        {
+            "type": "task.result",
+            "taskId": task["id"],
+            "summary": body[:140],
+            "result": {"content": body, "codingTaskId": coding_task_id, "status": status},
+        }
+    )
+
 
 def handle_chat(task, context) -> None:
     if context.get("kind") != "chat":
@@ -108,6 +221,9 @@ def handle_chat(task, context) -> None:
     memories = context.get("memories") or []
     history = context.get("history") or []
     text = context.get("text", "")
+    if CODING_INTENT.search(text):
+        reply_via_coding(task, text)
+        return
     system = CHAT_SYSTEM
     if memories:
         system += "\n\nThings you remember about the person:\n" + "\n".join(

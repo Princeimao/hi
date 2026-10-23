@@ -34,6 +34,7 @@ contextBridge.exposeInMainWorld("hi", {
   setPaused: (paused: boolean) => ipcRenderer.send("presence:paused", paused),
   restAuth: () => ipcRenderer.invoke("relay:auth") as Promise<unknown>,
   home: () => ipcRenderer.invoke("cwd:home"),
+  openExternal: (url: string) => ipcRenderer.invoke("shell:open-external", url) as Promise<boolean>,
   lanIp: () => ipcRenderer.invoke("net:lan-ip"),
   mediaAction: (kind: string, steps?: number) => ipcRenderer.send("media:action", kind, steps ?? 1),
   mediaInfo: () => ipcRenderer.invoke("media:info") as Promise<unknown>,

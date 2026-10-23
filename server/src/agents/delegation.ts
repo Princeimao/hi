@@ -99,6 +99,13 @@ class Delegation {
 
   /** Push the task to an online agent, or run it locally on the hub. */
   private async assign(task: AgentTask, context: Record<string, unknown>): Promise<void> {
+    // Coding tasks never touch the agent registry: the user's authenticated
+    // desktop island runs the real CLI and streams progress back.
+    if (task.kind === "coding") {
+      const { codingBroker, codingContextFrom } = await import("./coding.js");
+      await codingBroker.dispatch(task, codingContextFrom(context, task.title));
+      return;
+    }
     const candidates = agentRegistry.byCapability(task.kind);
     const agent = candidates[0];
     if (agent && hub.hasDirectConnection(agent.agent)) {
@@ -136,6 +143,7 @@ class Delegation {
       `SELECT * FROM agent_tasks
        WHERE status = 'queued'
          AND kind = ANY($1::text[])
+         AND kind <> 'coding'
          AND (agent IS NULL OR agent = $2)
        ORDER BY created_at ASC
        LIMIT 5`,
@@ -186,6 +194,7 @@ class Delegation {
   async applyStep(taskId: string, agent: string, label: string): Promise<void> {
     const task = await getTask(taskId);
     if (!task) return;
+    await query(`UPDATE agent_tasks SET updated_at = now() WHERE id = $1`, [taskId]);
     await logActivity(task.user_id, agent, label, "info", taskId);
     await bus.emit(task.user_id, {
       type: "task.step",
@@ -324,6 +333,20 @@ class Delegation {
         console.error(`[delegation] finalizer failed: ${(err as Error).message}`),
       );
     }
+  }
+
+  /** User-initiated cancel; coding tasks also stop the local process tree. */
+  async cancelTask(userId: string, taskId: string): Promise<boolean> {
+    const task = await getTask(taskId);
+    if (!task || task.user_id !== userId) return false;
+    if (!["queued", "running", "waiting_input"].includes(task.status)) return false;
+    if (task.kind === "coding") {
+      const { codingBroker } = await import("./coding.js");
+      return codingBroker.cancel(userId, taskId);
+    }
+    await this.applyUpdate(taskId, { status: "cancelled" });
+    await logActivity(userId, "user", `Task cancelled: ${task.title}`, "info", taskId);
+    return true;
   }
 
   async onAgentOffline(agent: string): Promise<void> {
